@@ -88,6 +88,9 @@ mod provider;
 mod reporter;
 mod urls;
 
+/// The number of conflicts a package may accumulate before we re-prioritize and backtrack.
+const CONFLICT_THRESHOLD: usize = 5;
+
 pub struct Resolver<Provider: ResolverProvider, InstalledPackages: InstalledPackagesProvider> {
     state: ResolverState<InstalledPackages>,
     provider: Provider,
@@ -324,16 +327,34 @@ impl<InstalledPackages: InstalledPackagesProvider> ResolverState<InstalledPackag
             let start = Instant::now();
             loop {
                 // Run unit propagation.
-                if let Err(err) = state.pubgrub.unit_propagation(state.next) {
-                    return Err(self.convert_no_solution_err(
-                        err,
-                        state.fork_urls,
-                        &state.fork_indexes,
-                        state.env,
-                        &visited,
-                        &self.locations,
-                        &self.capabilities,
-                    ));
+                let result = state.pubgrub.unit_propagation(state.next);
+                // End the mutable borrow of `state.pubgrub`.
+                let result = result.map(|conflict| {
+                    conflict.map(|conflict| {
+                        conflict.map(|(package, _term)| package).collect::<Vec<_>>()
+                    })
+                });
+                match result {
+                    Err(err) => {
+                        // If unit propagation failed, the is no solution.
+                        return Err(self.convert_no_solution_err(
+                            err,
+                            state.fork_urls,
+                            &state.fork_indexes,
+                            state.env,
+                            &visited,
+                            &self.locations,
+                            &self.capabilities,
+                        ));
+                    }
+                    Ok(Some(conflict)) => {
+                        // Conflict tracking: If the version was rejected due to its dependencies,
+                        // record culprit and affected.
+                        state.record_conflict(state.next, conflict);
+                    }
+                    // There was no conflict, or we've already rejected the last version due to its
+                    // dependencies.
+                    Ok(None) => {}
                 }
 
                 // Pre-visit all candidate packages, to allow metadata to be fetched in parallel.
@@ -351,6 +372,18 @@ impl<InstalledPackages: InstalledPackagesProvider> ResolverState<InstalledPackag
                     )?;
                 }
 
+                Self::reprioritize_conflicts(&mut state);
+
+                trace!(
+                    "assigned packages: {}",
+                    state
+                        .pubgrub
+                        .partial_solution
+                        .extract_solution()
+                        .filter(|(p, _)| !state.pubgrub.package_store[*p].is_proxy())
+                        .map(|(p, v)| format!("{}=={}", state.pubgrub.package_store[p], v))
+                        .join(", ")
+                );
                 // Choose a package version.
                 let Some(highest_priority_pkg) = state
                     .pubgrub
@@ -399,6 +432,17 @@ impl<InstalledPackages: InstalledPackagesProvider> ResolverState<InstalledPackag
                     resolutions.push(resolution);
                     continue 'FORK;
                 };
+                trace!(
+                    "Chose package for decision: {}. remaining choices: {}",
+                    state.pubgrub.package_store[highest_priority_pkg],
+                    state
+                        .pubgrub
+                        .partial_solution
+                        .undecided_packages()
+                        .filter(|(p, _)| !state.pubgrub.package_store[**p].is_proxy())
+                        .map(|(p, _)| state.pubgrub.package_store[*p].to_string())
+                        .join(", ")
+                );
 
                 state.next = highest_priority_pkg;
 
@@ -623,6 +667,48 @@ impl<InstalledPackages: InstalledPackagesProvider> ResolverState<InstalledPackag
             self.selector.resolution_strategy(),
             self.options,
         )
+    }
+
+    /// Change the priority of often conflicting packages and backtrack.
+    ///
+    /// To be called after unit propagation.
+    fn reprioritize_conflicts(state: &mut ForkState) {
+        for package in state.conflict_tracker.priotize.drain(..) {
+            let changed = state
+                .priorities
+                .make_conflict_early(&state.pubgrub.package_store[package]);
+            if changed {
+                debug!(
+                    "Package {} has too many conflicts (affected), prioritizing",
+                    &state.pubgrub.package_store[package]
+                );
+            } else {
+                debug!(
+                    "Package {} has too many conflicts (affected), already {:?}",
+                    state.pubgrub.package_store[package],
+                    state.priorities.get(&state.pubgrub.package_store[package])
+                );
+            }
+        }
+
+        for package in state.conflict_tracker.depriotize.drain(..) {
+            let changed = state
+                .priorities
+                .make_conflict_late(&state.pubgrub.package_store[package]);
+            if changed {
+                debug!(
+                    "Package {} has too many conflicts (culprit), deprioritizing and backtracking",
+                    state.pubgrub.package_store[package],
+                );
+                state.pubgrub.backtrack_package(package);
+            } else {
+                debug!(
+                    "Package {} has too many conflicts (culprit), already {:?}",
+                    state.pubgrub.package_store[package],
+                    state.priorities.get(&state.pubgrub.package_store[package])
+                );
+            }
+        }
     }
 
     /// When trace level logging is enabled, we dump the final
@@ -2150,6 +2236,7 @@ pub(crate) struct ForkState {
     /// The top fork has a narrower Python compatibility range, and thus can find a
     /// solution that omits Python 3.8 support.
     python_requirement: PythonRequirement,
+    conflict_tracker: ConflictTracker,
 }
 
 impl ForkState {
@@ -2168,6 +2255,7 @@ impl ForkState {
             added_dependencies: FxHashMap::default(),
             env,
             python_requirement,
+            conflict_tracker: ConflictTracker::default(),
         }
     }
 
@@ -2253,7 +2341,7 @@ impl ForkState {
             self.priorities.insert(package, version, &self.fork_urls);
         }
 
-        self.pubgrub.add_package_version_dependencies(
+        let conflict = self.pubgrub.add_package_version_dependencies(
             self.next,
             for_version.clone(),
             dependencies.into_iter().map(|dependency| {
@@ -2265,7 +2353,46 @@ impl ForkState {
                 (package, version)
             }),
         );
+        // End the mutable borrow of `self.pubgrub`
+        let conflict: Option<Vec<_>> =
+            conflict.map(|x| x.map(|(package, _term)| package).collect());
+
+        // Conflict tracking: If the version was rejected due to its dependencies, record culprit
+        // and affected.
+        if let Some(conflict) = conflict {
+            self.record_conflict(for_package, conflict);
+        }
         Ok(())
+    }
+
+    fn record_conflict(&mut self, affected: Id<PubGrubPackage>, conflict: Vec<Id<PubGrubPackage>>) {
+        debug!(
+            "Recording dependency conflict of {} from incompatibility of ({})",
+            self.pubgrub.package_store[affected],
+            conflict
+                .iter()
+                .map(|package| self.pubgrub.package_store[*package].to_owned())
+                .join(", ")
+        );
+        let affected_count = self.conflict_tracker.affected.entry(self.next).or_default();
+        *affected_count += 1;
+        if *affected_count == CONFLICT_THRESHOLD {
+            self.conflict_tracker.priotize.push(self.next);
+        }
+        for incompatible in conflict {
+            if incompatible == self.next {
+                continue;
+            }
+            let culprit_count = self
+                .conflict_tracker
+                .culprit
+                .entry(incompatible)
+                .or_default();
+            *culprit_count += 1;
+            if *culprit_count == CONFLICT_THRESHOLD {
+                self.conflict_tracker.depriotize.push(incompatible);
+            }
+        }
     }
 
     fn add_unavailable_version(&mut self, version: Version, reason: UnavailableVersion) {
@@ -3171,4 +3298,20 @@ fn find_conflicting_extra(conflicting: &Conflicts, reqs: &[Requirement]) -> Opti
         }
     }
     None
+}
+
+#[derive(Debug, Default, Clone)]
+struct ConflictTracker {
+    /// How often a decision on the package was discarded due to another package decided earlier.
+    affected: FxHashMap<Id<PubGrubPackage>, usize>,
+    /// Package(s) to be prioritized after the next unit propagation
+    ///
+    /// Distilled from `affected` for fast checking in the hot loop.
+    priotize: Vec<Id<PubGrubPackage>>,
+    /// How often a package was decided earlier and caused another package to be discarded.
+    culprit: FxHashMap<Id<PubGrubPackage>, usize>,
+    /// Package(s) to be de-prioritized after the next unit propagation
+    ///
+    /// Distilled from `culprit` for fast checking in the hot loop.
+    depriotize: Vec<Id<PubGrubPackage>>,
 }
